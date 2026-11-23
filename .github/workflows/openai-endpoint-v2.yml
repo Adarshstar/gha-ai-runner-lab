@@ -111,30 +111,38 @@ jobs:
             | tee chat_search.json
           python3 -c "import json;d=json.load(open('chat_search.json'));print('SEARCH_ASSISTANT:',d['choices'][0]['message']['content'][:300]);print('gha_v2',d.get('gha_v2'))"
 
-      - name: Public tunnel + publish
+      - name: Public tunnel (cloudflared) + publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          sudo npm install -g localtunnel
-          # bypass reminder page
-          nohup lt --port 8080 --print-requests > lt.log 2>&1 &
-          echo $! > lt.pid
+          # Cloudflare Quick Tunnel — far more reliable than localtunnel for mobile/SSE
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          nohup /tmp/cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cf.log 2>&1 &
+          echo $! > cf.pid
           URL=""
-          for i in $(seq 1 90); do
-            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.loca\.lt' lt.log | head -1 || true)
-            if [ -z "$URL" ]; then URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.localtunnel\.me' lt.log | head -1 || true); fi
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cf.log | head -1 || true)
             if [ -n "$URL" ]; then break; fi
             sleep 2
           done
           test -n "$URL"
           echo "PUBLIC_URL=$URL" | tee public_url.txt
           echo "BASE_URL=$URL/v1"
-
-          # smoke public endpoints (bypass localtunnel reminder with header)
-          curl -fsS -H "Bypass-Tunnel-Reminder: 1" "$URL/health" | tee public_health.json || true
-          curl -fsS -H "Bypass-Tunnel-Reminder: 1" -H "Authorization: Bearer sk-gha-v2" "$URL/v1/models" | tee public_models.json || true
-
+          # smoke
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          curl -fsS "$URL/health" | tee public_health.json
+          echo
+          # SSE smoke
+          curl -s -m 25 -H "Content-Type: application/json" \
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Hi"}],"max_tokens":20,"stream":true}' \
+            "$URL/v1/chat/completions" | head -c 400 || true
+          echo
           git config user.name gha-bot
           git config user.email gha-bot@users.noreply.github.com
           git fetch origin || true
@@ -144,35 +152,16 @@ jobs:
           printf 'qwen2.5:0.5b\n' > LIVE_MODEL_V2.txt
           printf 'sk-gha-v2\n' > LIVE_API_KEY_V2.txt
           cat > LIVE_ENDPOINT_V2.md << MD
-          # GHA v2 OpenAI endpoint (PocketPal ready)
-
-          **Base URL (for PocketPal):** \`$URL/v1\`
-
-          **API Key (optional):** \`sk-gha-v2\`
-
-          **Model:** \`qwen2.5:0.5b\`
-
-          ## PocketPal Android setup
-          1. Open PocketPal → Settings / Servers (or Remote models)
-          2. Add server:
-             - Base URL: \`$URL/v1\`
-             - API Key: \`sk-gha-v2\`
-             - Name: GHA v2 Search
-          3. Test connection → should list models
-          4. Select the remote model and chat
-          5. Ask questions that need search (e.g. "What is the capital of France?") — web search + page fetch run on the GHA side automatically
-
-          ## Endpoints
-          - GET  $URL/health
-          - GET  $URL/v1/models
-          - POST $URL/v1/chat/completions  (stream=true → SSE)
-          - POST $URL/v1/tools/web_search
-          - POST $URL/v1/tools/web_fetch
-
-          Live until the Actions job ends (default 3h, max 5h).
-          MD
+# GHA AI v2 — PocketPal ready (cloudflared)
+**Base URL:** `$URL/v1`
+**API Key:** `sk-gha-v2`
+**Model:** `qwen2.5:0.5b`
+Features: SSE streaming, auto web_search + web_fetch, CORS, optional auth.
+Tunnel: Cloudflare Quick Tunnel (trycloudflare.com) — stable for mobile.
+Live until the Actions job ends (default 3h, max 5h).
+MD
           git add LIVE_BASE_URL_V2.txt LIVE_OPENAI_BASE_V2.txt LIVE_MODEL_V2.txt LIVE_API_KEY_V2.txt LIVE_ENDPOINT_V2.md || true
-          git commit -m "v2 PocketPal live $URL" || true
+          git commit -m "v2 live $URL (cloudflared + PocketPal)" || true
           git push -f origin live-endpoint-v2 || echo "publish failed, hold continues"
 
       - name: Hold
@@ -188,6 +177,7 @@ jobs:
           while [ $SECONDS -lt $END ]; do
             kill -0 $(cat ollama.pid) 2>/dev/null || exit 1
             kill -0 $(cat gateway.pid) 2>/dev/null || exit 1
+            kill -0 $(cat cf.pid) 2>/dev/null || exit 1
             curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
             echo "$(date -u +%H:%M:%S)Z v2 still up $URL/v1"
             sleep 30
