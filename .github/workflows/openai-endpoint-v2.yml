@@ -116,7 +116,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
-          # Cloudflare Quick Tunnel — far more reliable than localtunnel for mobile/SSE
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
           chmod +x /tmp/cloudflared
           nohup /tmp/cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cf.log 2>&1 &
@@ -130,7 +129,6 @@ jobs:
           test -n "$URL"
           echo "PUBLIC_URL=$URL" | tee public_url.txt
           echo "BASE_URL=$URL/v1"
-          # smoke
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo 000)
             [ "$code" = "200" ] && break
@@ -138,7 +136,6 @@ jobs:
           done
           curl -fsS "$URL/health" | tee public_health.json
           echo
-          # SSE smoke
           curl -s -m 25 -H "Content-Type: application/json" \
             -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Hi"}],"max_tokens":20,"stream":true}' \
             "$URL/v1/chat/completions" | head -c 400 || true
@@ -151,15 +148,14 @@ jobs:
           printf '%s/v1\n' "$URL" > LIVE_OPENAI_BASE_V2.txt
           printf 'qwen2.5:0.5b\n' > LIVE_MODEL_V2.txt
           printf 'sk-gha-v2\n' > LIVE_API_KEY_V2.txt
-          cat > LIVE_ENDPOINT_V2.md << MD
-# GHA AI v2 — PocketPal ready (cloudflared)
-**Base URL:** `$URL/v1`
-**API Key:** `sk-gha-v2`
-**Model:** `qwen2.5:0.5b`
-Features: SSE streaming, auto web_search + web_fetch, CORS, optional auth.
-Tunnel: Cloudflare Quick Tunnel (trycloudflare.com) — stable for mobile.
-Live until the Actions job ends (default 3h, max 5h).
-MD
+          {
+            echo "# GHA AI v2 — PocketPal ready (cloudflared)"
+            echo "Base URL: $URL/v1"
+            echo "API Key: sk-gha-v2"
+            echo "Model: qwen2.5:0.5b"
+            echo "Tunnel: Cloudflare Quick Tunnel (trycloudflare.com)"
+            echo "Features: SSE streaming, auto web_search + web_fetch, CORS"
+          } > LIVE_ENDPOINT_V2.md
           git add LIVE_BASE_URL_V2.txt LIVE_OPENAI_BASE_V2.txt LIVE_MODEL_V2.txt LIVE_API_KEY_V2.txt LIVE_ENDPOINT_V2.md || true
           git commit -m "v2 live $URL (cloudflared + PocketPal)" || true
           git push -f origin live-endpoint-v2 || echo "publish failed, hold continues"
