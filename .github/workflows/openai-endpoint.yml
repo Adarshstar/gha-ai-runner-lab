@@ -7,6 +7,9 @@ on:
         description: "Minutes to keep endpoint alive"
         required: false
         default: "12"
+  push:
+    paths:
+      - ".github/workflows/openai-endpoint.yml"
 
 jobs:
   serve:
@@ -17,10 +20,9 @@ jobs:
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
-          # start daemon
           ollama serve >ollama.log 2>&1 &
           echo $! > ollama.pid
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
             sleep 1
           done
@@ -29,12 +31,10 @@ jobs:
       - name: Pull fast small model
         run: |
           set -e
-          # tiny + fast on CPU; OpenAI API uses this name as model id
           ollama pull qwen2.5:0.5b
           ollama list
 
       - name: Install cloudflared + public tunnel
-        id: tunnel
         run: |
           set -e
           curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
@@ -49,43 +49,31 @@ jobs:
           done
           echo "PUBLIC_URL=$URL" | tee public_url.txt
           test -n "$URL"
-          echo "============================================"
-          echo "OpenAI-compatible base URL:"
-          echo "  $URL/v1"
-          echo "Model id: qwen2.5:0.5b"
-          echo "============================================"
+          echo "OpenAI base URL: $URL/v1"
+          echo "Model: qwen2.5:0.5b"
 
-      - name: Smoke test OpenAI chat completions
+      - name: Smoke test
         run: |
           set -e
           URL=$(cut -d= -f2 public_url.txt)
-          echo "GET $URL/api/tags"
-          curl -fsS "$URL/api/tags" | head -c 500; echo
-          echo "POST $URL/v1/chat/completions"
+          curl -fsS "$URL/api/tags" | head -c 400; echo
           curl -fsS "$URL/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Reply with exactly: ENDPOINT_OK"}],"max_tokens":32,"temperature":0}' \
             | tee smoke.json
           echo
-          python3 - <<'PY'
-import json
-d=json.load(open("smoke.json"))
-print("ASSISTANT:", d["choices"][0]["message"]["content"])
-PY
+          python3 -c "import json;d=json.load(open('smoke.json'));print('ASSISTANT:',d['choices'][0]['message']['content'])"
 
       - name: Hold endpoint
         run: |
-          HOLD=${{ github.event.inputs.hold_minutes || '12' }}
+          HOLD=12
+          if [ -n "${{ github.event.inputs.hold_minutes }}" ]; then HOLD="${{ github.event.inputs.hold_minutes }}"; fi
           URL=$(cut -d= -f2 public_url.txt)
-          echo "LIVE OpenAI endpoint for ~${HOLD} min:"
-          echo "  BASE: $URL/v1"
-          echo "  MODEL: qwen2.5:0.5b"
-          echo "curl example:"
-          echo "curl $URL/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"qwen2.5:0.5b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'"
+          echo "LIVE: $URL/v1  model=qwen2.5:0.5b  for ${HOLD}m"
           SECS=$((HOLD * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
-            kill -0 $(cat ollama.pid) 2>/dev/null || { echo ollama died; exit 1; }
+            kill -0 $(cat ollama.pid) 2>/dev/null || exit 1
             curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || exit 1
             echo "$(date -u +%H:%M:%S)Z still up $URL/v1"
             sleep 30
