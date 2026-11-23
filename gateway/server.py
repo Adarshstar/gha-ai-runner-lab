@@ -94,7 +94,10 @@ def searx_search(query: str, num: int = 5) -> list[dict]:
 
 def ddgs_search(query: str, num: int = 5) -> list[dict]:
     try:
-        from ddgs import DDGS
+        try:
+            from ddgs import DDGS
+        except ImportError:
+            from duckduckgo_search import DDGS
         out = []
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=num):
@@ -135,7 +138,7 @@ def web_fetch(url: str, max_chars: int = 12000) -> dict:
         if "json" in ctype:
             text = r.text[:max_chars]
         elif "html" in ctype or "xml" in ctype or not ctype:
-            soup = BeautifulSoup(r.text, "lxml")
+            soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
                 tag.decompose()
             text = " ".join(soup.get_text(" ", strip=True).split())
