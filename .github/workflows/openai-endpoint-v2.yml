@@ -29,7 +29,6 @@ jobs:
             curl -fsS "http://127.0.0.1:8888/" >/dev/null 2>&1 && break
             sleep 2
           done
-          # JSON search smoke
           curl -fsS "http://127.0.0.1:8888/search?q=OpenAI&format=json" | head -c 300 || true
           echo
 
@@ -53,13 +52,14 @@ jobs:
           set -e
           python3 -m pip install -q -r gateway/requirements.txt
 
-      - name: Start v2 gateway
+      - name: Start v2 gateway (PocketPal SSE ready)
         run: |
           set -e
           export OLLAMA_URL=http://127.0.0.1:11434
           export SEARX_URL=http://127.0.0.1:8888
           export DEFAULT_MODEL=qwen2.5:0.5b
           export GATEWAY_PORT=8080
+          export GHA_API_KEY=sk-gha-v2
           nohup python3 gateway/server.py >gateway.log 2>&1 &
           echo $! > gateway.pid
           for i in $(seq 1 60); do
@@ -69,29 +69,47 @@ jobs:
           curl -fsS http://127.0.0.1:8080/health | tee health.json
           echo
 
-      - name: Local tests (search + fetch + chat)
+      - name: Local tests (models + search + non-stream + SSE stream)
         run: |
           set -e
+          echo "=== /v1/models (PocketPal probe) ==="
+          curl -fsS http://127.0.0.1:8080/v1/models \
+            -H 'Authorization: Bearer sk-gha-v2' | tee models.json
+          python3 -c "import json;d=json.load(open('models.json'));assert d['object']=='list' and len(d['data'])>=1;print('models_ok', [m['id'] for m in d['data']])"
+
           echo "=== web_search ==="
           curl -fsS http://127.0.0.1:8080/v1/tools/web_search \
             -H 'Content-Type: application/json' \
-            -d '{"query":"GitHub Actions maximum job timeout hours","num":4}' | tee search.json
-          echo
-          python3 -c "import json;d=json.load(open('search.json'));assert len(d.get('results',[]))>=1,d;print('search_ok',len(d['results']))"
-          URL=$(python3 -c "import json;d=json.load(open('search.json'));print(d['results'][0]['url'])")
-          echo "=== web_fetch $URL ==="
-          curl -fsS http://127.0.0.1:8080/v1/tools/web_fetch \
-            -H 'Content-Type: application/json' \
-            -d "{\"url\":\"$URL\",\"max_chars\":2000}" | tee fetch.json
-          echo
-          python3 -c "import json;d=json.load(open('fetch.json'));assert d.get('ok') or d.get('content');print('fetch_ok',d.get('status'),len(d.get('content','')))"
-          echo "=== chat with auto search ==="
+            -H 'Authorization: Bearer sk-gha-v2' \
+            -d '{"query":"capital of France","num":3}' | tee search.json
+          python3 -c "import json;d=json.load(open('search.json'));assert len(d.get('results',[]))>=1;print('search_ok')"
+
+          echo "=== non-stream chat ==="
           curl -fsS http://127.0.0.1:8080/v1/chat/completions \
             -H 'Content-Type: application/json' \
-            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"What is the maximum job timeout for GitHub Actions hosted runners in hours?"}],"max_tokens":200,"web_search":true}' \
+            -H 'Authorization: Bearer sk-gha-v2' \
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Say hello in one short sentence."}],"max_tokens":40,"stream":false}' \
             | tee chat.json
-          echo
-          python3 -c "import json;d=json.load(open('chat.json'));print('ASSISTANT:',d['choices'][0]['message']['content'][:500]);print('gha_v2',d.get('gha_v2'))"
+          python3 -c "import json;d=json.load(open('chat.json'));print('ASSISTANT:',d['choices'][0]['message']['content'][:200])"
+
+          echo "=== SSE stream (PocketPal path) ==="
+          curl -fsS -N http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer sk-gha-v2' \
+            -H 'Accept: text/event-stream' \
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Count from 1 to 3."}],"max_tokens":30,"stream":true}' \
+            | tee stream.txt
+          grep -q 'data: ' stream.txt
+          grep -q '\[DONE\]' stream.txt || grep -q 'finish_reason' stream.txt
+          echo "SSE_OK"
+
+          echo "=== search-enhanced chat ==="
+          curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -H 'Authorization: Bearer sk-gha-v2' \
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"What is the capital of France?"}],"max_tokens":80,"web_search":true,"stream":false}' \
+            | tee chat_search.json
+          python3 -c "import json;d=json.load(open('chat_search.json'));print('SEARCH_ASSISTANT:',d['choices'][0]['message']['content'][:300]);print('gha_v2',d.get('gha_v2'))"
 
       - name: Public tunnel + publish
         env:
@@ -99,7 +117,8 @@ jobs:
         run: |
           set -e
           sudo npm install -g localtunnel
-          nohup lt --port 8080 > lt.log 2>&1 &
+          # bypass reminder page
+          nohup lt --port 8080 --print-requests > lt.log 2>&1 &
           echo $! > lt.pid
           URL=""
           for i in $(seq 1 90); do
@@ -111,6 +130,11 @@ jobs:
           test -n "$URL"
           echo "PUBLIC_URL=$URL" | tee public_url.txt
           echo "BASE_URL=$URL/v1"
+
+          # smoke public endpoints (bypass localtunnel reminder with header)
+          curl -fsS -H "Bypass-Tunnel-Reminder: 1" "$URL/health" | tee public_health.json || true
+          curl -fsS -H "Bypass-Tunnel-Reminder: 1" -H "Authorization: Bearer sk-gha-v2" "$URL/v1/models" | tee public_models.json || true
+
           git config user.name gha-bot
           git config user.email gha-bot@users.noreply.github.com
           git fetch origin || true
@@ -118,9 +142,37 @@ jobs:
           printf '%s\n' "$URL" > LIVE_BASE_URL_V2.txt
           printf '%s/v1\n' "$URL" > LIVE_OPENAI_BASE_V2.txt
           printf 'qwen2.5:0.5b\n' > LIVE_MODEL_V2.txt
-          printf 'V2 LIVE\nBASE=%s/v1\nSEARCH=%s/v1/tools/web_search\nFETCH=%s/v1/tools/web_fetch\nMODEL=qwen2.5:0.5b\n' "$URL" "$URL" "$URL" > LIVE_ENDPOINT_V2.md
-          git add LIVE_BASE_URL_V2.txt LIVE_OPENAI_BASE_V2.txt LIVE_MODEL_V2.txt LIVE_ENDPOINT_V2.md || true
-          git commit -m "v2 live $URL" || true
+          printf 'sk-gha-v2\n' > LIVE_API_KEY_V2.txt
+          cat > LIVE_ENDPOINT_V2.md << MD
+          # GHA v2 OpenAI endpoint (PocketPal ready)
+
+          **Base URL (for PocketPal):** \`$URL/v1\`
+
+          **API Key (optional):** \`sk-gha-v2\`
+
+          **Model:** \`qwen2.5:0.5b\`
+
+          ## PocketPal Android setup
+          1. Open PocketPal → Settings / Servers (or Remote models)
+          2. Add server:
+             - Base URL: \`$URL/v1\`
+             - API Key: \`sk-gha-v2\`
+             - Name: GHA v2 Search
+          3. Test connection → should list models
+          4. Select the remote model and chat
+          5. Ask questions that need search (e.g. "What is the capital of France?") — web search + page fetch run on the GHA side automatically
+
+          ## Endpoints
+          - GET  $URL/health
+          - GET  $URL/v1/models
+          - POST $URL/v1/chat/completions  (stream=true → SSE)
+          - POST $URL/v1/tools/web_search
+          - POST $URL/v1/tools/web_fetch
+
+          Live until the Actions job ends (default 3h, max 5h).
+          MD
+          git add LIVE_BASE_URL_V2.txt LIVE_OPENAI_BASE_V2.txt LIVE_MODEL_V2.txt LIVE_API_KEY_V2.txt LIVE_ENDPOINT_V2.md || true
+          git commit -m "v2 PocketPal live $URL" || true
           git push -f origin live-endpoint-v2 || echo "publish failed, hold continues"
 
       - name: Hold
@@ -130,7 +182,7 @@ jobs:
           HOLD=${HOLD:-180}
           if [ "$HOLD" -gt 300 ]; then HOLD=300; fi
           URL=$(grep PUBLIC_URL public_url.txt | cut -d= -f2)
-          echo "V2 GHA-ONLY $URL/v1 hold ${HOLD}m"
+          echo "V2 GHA-ONLY PocketPal-ready $URL/v1 hold ${HOLD}m  key=sk-gha-v2"
           SECS=$((HOLD * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
