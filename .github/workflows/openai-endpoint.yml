@@ -4,110 +4,89 @@ on:
   workflow_dispatch:
     inputs:
       hold_minutes:
-        description: "How long to keep the endpoint alive"
+        description: "Minutes to keep endpoint alive"
         required: false
-        default: "15"
+        default: "12"
 
 jobs:
   serve:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - name: Install deps + llama-server
+      - name: Install Ollama
         run: |
           set -e
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq curl jq unzip >/dev/null
-          # Prebuilt llama.cpp release (linux x64)
-          TAG=$(curl -fsSL https://api.github.com/repos/ggerganov/llama.cpp/releases/latest | jq -r .tag_name)
-          echo "llama.cpp tag=$TAG"
-          # Prefer ubuntu binary asset if present; else build quickly
-          curl -fsSL -o llama.zip "https://github.com/ggerganov/llama.cpp/archive/refs/tags/${TAG}.zip" || \
-            curl -fsSL -o llama.zip "https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.zip"
-          unzip -q llama.zip
-          SRC=$(ls -d llama.cpp* | head -1)
-          cmake -S "$SRC" -B build -DGGML_NATIVE=OFF -DGGML_CPU=ON
-          cmake --build build -j"$(nproc)" --target llama-server
-
-      - name: Download small fast GGUF
-        run: |
-          set -e
-          mkdir -p models
-          # Qwen2.5-0.5B Instruct Q4 — fits runner, fast CPU
-          curl -L --fail --retry 3 -o models/model.gguf \
-            "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"
-          ls -lh models/model.gguf
-
-      - name: Start OpenAI-compatible server
-        run: |
-          set -e
-          ./build/bin/llama-server \
-            -m models/model.gguf \
-            --host 127.0.0.1 --port 8080 \
-            -t "$(nproc)" -c 4096 -n 256 \
-            --parallel 1 \
-            >server.log 2>&1 &
-          echo $! > server.pid
+          curl -fsSL https://ollama.com/install.sh | sh
+          # start daemon
+          ollama serve >ollama.log 2>&1 &
+          echo $! > ollama.pid
           for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
-              echo "server healthy"
-              curl -sS http://127.0.0.1:8080/v1/models || true
-              break
-            fi
-            sleep 2
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+            sleep 1
           done
-          curl -fsS http://127.0.0.1:8080/health
+          curl -fsS http://127.0.0.1:11434/api/tags
 
-      - name: Install cloudflared + publish temp URL
+      - name: Pull fast small model
+        run: |
+          set -e
+          # tiny + fast on CPU; OpenAI API uses this name as model id
+          ollama pull qwen2.5:0.5b
+          ollama list
+
+      - name: Install cloudflared + public tunnel
         id: tunnel
         run: |
           set -e
           curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
           sudo dpkg -i cloudflared.deb
-          # Quick tunnel → public https URL (no account)
-          cloudflared tunnel --url http://127.0.0.1:8080 > tunnel.log 2>&1 &
+          cloudflared tunnel --url http://127.0.0.1:11434 > tunnel.log 2>&1 &
           echo $! > tunnel.pid
-          for i in $(seq 1 45); do
+          URL=""
+          for i in $(seq 1 60); do
             URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
-            if [ -n "$URL" ]; then
-              echo "PUBLIC_URL=$URL" | tee public_url.txt
-              echo "url=$URL" >> "$GITHUB_OUTPUT"
-              echo "============================================"
-              echo "OpenAI base URL: $URL/v1"
-              echo "Example:"
-              echo "curl $URL/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"model\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'"
-              echo "============================================"
-              break
-            fi
+            if [ -n "$URL" ]; then break; fi
             sleep 2
           done
+          echo "PUBLIC_URL=$URL" | tee public_url.txt
           test -n "$URL"
+          echo "============================================"
+          echo "OpenAI-compatible base URL:"
+          echo "  $URL/v1"
+          echo "Model id: qwen2.5:0.5b"
+          echo "============================================"
 
-      - name: Smoke test via public URL
+      - name: Smoke test OpenAI chat completions
         run: |
           set -e
-          URL=$(cat public_url.txt | cut -d= -f2)
-          curl -fsS "$URL/health" || curl -fsS "$URL/v1/models"
-          echo
+          URL=$(cut -d= -f2 public_url.txt)
+          echo "GET $URL/api/tags"
+          curl -fsS "$URL/api/tags" | head -c 500; echo
+          echo "POST $URL/v1/chat/completions"
           curl -fsS "$URL/v1/chat/completions" \
             -H "Content-Type: application/json" \
-            -d '{"model":"model","messages":[{"role":"user","content":"Reply with exactly: ENDPOINT_OK"}],"max_tokens":20}' \
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Reply with exactly: ENDPOINT_OK"}],"max_tokens":32,"temperature":0}' \
             | tee smoke.json
           echo
+          python3 - <<'PY'
+import json
+d=json.load(open("smoke.json"))
+print("ASSISTANT:", d["choices"][0]["message"]["content"])
+PY
 
-      - name: Hold endpoint open
+      - name: Hold endpoint
         run: |
-          HOLD=${{ github.event.inputs.hold_minutes || '15' }}
-          URL=$(cat public_url.txt | cut -d= -f2)
-          echo "Endpoint live for ~${HOLD} minutes: $URL/v1"
-          echo "base_url=$URL/v1"
-          # keep alive
+          HOLD=${{ github.event.inputs.hold_minutes || '12' }}
+          URL=$(cut -d= -f2 public_url.txt)
+          echo "LIVE OpenAI endpoint for ~${HOLD} min:"
+          echo "  BASE: $URL/v1"
+          echo "  MODEL: qwen2.5:0.5b"
+          echo "curl example:"
+          echo "curl $URL/v1/chat/completions -H 'Content-Type: application/json' -d '{\"model\":\"qwen2.5:0.5b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'"
           SECS=$((HOLD * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
-            if ! kill -0 $(cat server.pid) 2>/dev/null; then echo "server died"; exit 1; fi
-            curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
-            echo "$(date -u +%H:%M:%S) still up $URL/v1"
+            kill -0 $(cat ollama.pid) 2>/dev/null || { echo ollama died; exit 1; }
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || exit 1
+            echo "$(date -u +%H:%M:%S)Z still up $URL/v1"
             sleep 30
           done
-          echo "Hold finished."
