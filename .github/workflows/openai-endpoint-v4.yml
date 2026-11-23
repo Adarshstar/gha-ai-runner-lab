@@ -1,0 +1,183 @@
+name: openai-endpoint-v4
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: "Minutes to keep v4 endpoint alive (max 300)"
+        required: false
+        default: "180"
+  push:
+    paths:
+      - "TRIGGER_V4"
+
+permissions:
+  contents: write
+
+jobs:
+  serve-v4:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SearXNG
+        run: |
+          set -e
+          docker run -d --name searxng -p 127.0.0.1:8888:8080 docker.io/searxng/searxng:latest
+          for i in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:8888/" >/dev/null 2>&1 && break
+            sleep 2
+          done
+
+      - name: Install Ollama + qwen2.5:3b (warm)
+        run: |
+          set -e
+          curl -fsSL https://ollama.com/install.sh | sh
+          export OLLAMA_HOST=0.0.0.0:11434
+          export OLLAMA_ORIGINS='*'
+          nohup ollama serve >ollama.log 2>&1 &
+          echo $! > ollama.pid
+          for i in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+            sleep 1
+          done
+          ollama pull qwen2.5:3b
+          # Pre-warm so first user request is fast
+          curl -fsS http://127.0.0.1:11434/api/chat -d '{"model":"qwen2.5:3b","messages":[{"role":"user","content":"hi"}],"stream":false,"options":{"num_predict":8}}' >/dev/null || true
+          ollama list
+
+      - name: Install gateway deps
+        run: |
+          set -e
+          python3 -m pip install -q -r gateway/requirements.txt
+
+      - name: Start v4 gateway
+        run: |
+          set -e
+          export OLLAMA_URL=http://127.0.0.1:11434
+          export SEARX_URL=http://127.0.0.1:8888
+          export DEFAULT_MODEL=qwen2.5:3b
+          export GATEWAY_PORT=8080
+          export GHA_API_KEY=sk-gha-v4
+          export NUM_CTX=16384
+          # server.py is overwritten with v4 content in repo
+          nohup python3 gateway/server.py >gateway.log 2>&1 &
+          echo $! > gateway.pid
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/health | tee health.json
+
+      - name: Local tests (fast + search + models + props + SSE)
+        run: |
+          set -e
+          echo "=== models (rich) ==="
+          curl -fsS http://127.0.0.1:8080/v1/models | tee models.json
+          python3 -c "import json;d=json.load(open('models.json'));assert any(x['id']=='qwen2.5:3b' for x in d['data']);print('models_ok',len(d['data']))"
+          echo
+          echo "=== props ==="
+          curl -fsS http://127.0.0.1:8080/props | tee props.json
+          python3 -c "import json;d=json.load(open('props.json'));assert d['default_generation_settings']['n_ctx']>=8192;print('props_ok')"
+          echo
+          echo "=== FAST mode (no search — Hello) ==="
+          curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"gha-v4-fast","messages":[{"role":"user","content":"Hello"}],"max_tokens":40,"stream":false}' \
+            | tee fast.json
+          python3 -c "
+          import json
+          d=json.load(open('fast.json'))
+          m=d.get('gha_v4',{})
+          print('FAST mode:', m.get('mode'), 'search', m.get('web_search'), 'blocks', m.get('context_blocks'))
+          assert m.get('mode')=='fast' or m.get('web_search') is False
+          print('fast_ok')
+          "
+          echo
+          echo "=== SEARCH mode (explicit) ==="
+          curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"gha-v4-search","messages":[{"role":"user","content":"What is the capital of France? Cite sources."}],"max_tokens":150,"stream":false,"web_search":true}' \
+            | tee search_chat.json
+          python3 -c "
+          import json
+          d=json.load(open('search_chat.json'))
+          c=d['choices'][0]['message']['content']
+          m=d.get('gha_v4',{})
+          print('SEARCH assistant:', c[:250])
+          print('META:', m.get('mode'), 'blocks', m.get('context_blocks'), 'sources', len(m.get('sources') or []))
+          assert m.get('web_search') is True
+          assert m.get('context_blocks',0) >= 1 or len(m.get('sources') or []) >= 1
+          print('search_ok')
+          "
+          echo
+          echo "=== SSE ==="
+          curl -s -m 40 -H 'Content-Type: application/json' \
+            -d '{"model":"qwen2.5:3b","messages":[{"role":"user","content":"Say hi"}],"max_tokens":20,"stream":true}' \
+            http://127.0.0.1:8080/v1/chat/completions | head -c 400
+          echo
+          echo "ALL_LOCAL_TESTS_PASSED"
+
+      - name: Public tunnel (cloudflared) + publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          nohup /tmp/cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cf.log 2>&1 &
+          echo $! > cf.pid
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cf.log | head -1 || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          test -n "$URL"
+          echo "PUBLIC_URL=$URL" | tee public_url.txt
+          for i in $(seq 1 25); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          curl -fsS "$URL/health" | tee public_health.json
+          echo
+          git config user.name gha-bot
+          git config user.email gha-bot@users.noreply.github.com
+          git fetch origin || true
+          git checkout -B live-endpoint-v4 || true
+          printf '%s\n' "$URL" > LIVE_BASE_URL_V4.txt
+          printf '%s/v1\n' "$URL" > LIVE_OPENAI_BASE_V4.txt
+          printf 'qwen2.5:3b\n' > LIVE_MODEL_V4.txt
+          printf 'sk-gha-v4\n' > LIVE_API_KEY_V4.txt
+          {
+            echo "# GHA AI v4 — PocketPal native"
+            echo "Base URL: $URL/v1"
+            echo "API Key: sk-gha-v4"
+            echo "Model: qwen2.5:3b (16k ctx)"
+            echo "Modes: gha-v4-fast (default, no search) | gha-v4-search"
+            echo "Features: search off by default, /props, rich models, SSE, tools"
+          } > LIVE_ENDPOINT_V4.md
+          git add LIVE_BASE_URL_V4.txt LIVE_OPENAI_BASE_V4.txt LIVE_MODEL_V4.txt LIVE_API_KEY_V4.txt LIVE_ENDPOINT_V4.md || true
+          git commit -m "v4 live $URL (PocketPal native, search off by default)" || true
+          git push -f origin live-endpoint-v4 || echo "publish failed, hold continues"
+
+      - name: Hold
+        run: |
+          set -e
+          HOLD="${{ github.event.inputs.hold_minutes }}"
+          HOLD=${HOLD:-180}
+          if [ "$HOLD" -gt 300 ]; then HOLD=300; fi
+          URL=$(grep PUBLIC_URL public_url.txt | cut -d= -f2)
+          echo "V4 PocketPal-native $URL/v1 hold ${HOLD}m key=sk-gha-v4"
+          SECS=$((HOLD * 60))
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            kill -0 $(cat ollama.pid) 2>/dev/null || exit 1
+            kill -0 $(cat gateway.pid) 2>/dev/null || exit 1
+            kill -0 $(cat cf.pid) 2>/dev/null || exit 1
+            curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
+            echo "$(date -u +%H:%M:%S)Z v4 still up $URL/v1"
+            sleep 30
+          done
