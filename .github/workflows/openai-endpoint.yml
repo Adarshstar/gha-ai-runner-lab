@@ -11,6 +11,9 @@ on:
     paths:
       - "TRIGGER"
 
+permissions:
+  contents: write
+
 jobs:
   serve:
     runs-on: ubuntu-latest
@@ -57,17 +60,18 @@ jobs:
           test -n "$URL"
           echo "PUBLIC_URL=$URL" | tee public_url.txt
           echo "BASE_URL=$URL/v1"
+          # best-effort publish (do not fail job)
           git config user.name gha-bot
           git config user.email gha-bot@users.noreply.github.com
-          git fetch origin
-          git checkout -B live-endpoint
+          git fetch origin || true
+          git checkout -B live-endpoint || true
           printf '%s\n' "$URL" > LIVE_BASE_URL.txt
           printf '%s/v1\n' "$URL" > LIVE_OPENAI_BASE.txt
           printf 'qwen2.5:0.5b\n' > LIVE_MODEL.txt
-          printf 'LIVE GHA-only self-hosted\nBASE=%s/v1\nMODEL=qwen2.5:0.5b\n' "$URL" > LIVE_ENDPOINT.md
-          git add LIVE_BASE_URL.txt LIVE_OPENAI_BASE.txt LIVE_MODEL.txt LIVE_ENDPOINT.md
+          printf 'LIVE GHA-only\nBASE=%s/v1\nMODEL=qwen2.5:0.5b\n' "$URL" > LIVE_ENDPOINT.md
+          git add LIVE_BASE_URL.txt LIVE_OPENAI_BASE.txt LIVE_MODEL.txt LIVE_ENDPOINT.md || true
           git commit -m "live $URL" || true
-          git push -f origin live-endpoint
+          git push -f origin live-endpoint || echo "push failed, continuing hold"
 
       - name: Hold
         run: |
@@ -76,7 +80,7 @@ jobs:
           HOLD=${HOLD:-300}
           if [ "$HOLD" -gt 300 ]; then HOLD=300; fi
           URL=$(grep PUBLIC_URL public_url.txt | cut -d= -f2)
-          echo "GHA-ONLY $URL/v1 for ${HOLD}m"
+          echo "GHA-ONLY $URL/v1 for ${HOLD}m MODEL=qwen2.5:0.5b"
           SECS=$((HOLD * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
