@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""GHA AI v3 — PocketPal-ready OpenAI endpoint
-- Stronger model: qwen2.5:3b (fits GHA CPU, far better quality)
-- High context (num_ctx=16384)
-- Deterministic web search (never empty context)
-- Parallel SearXNG + DDGS + Wikipedia fallback
-- Real page fetch + clean extraction
-- Grounding system prompt + source citations
-- Full SSE streaming for PocketPal
-- Optional Bearer key, CORS
+"""GHA AI v4 — Production-grade PocketPal remote endpoint
+Design goals (from v4 plan):
+  - Search OFF by default (biggest speed win)
+  - Dual models: fast (no search) + search-enabled
+  - Rich /v1/models metadata (context_length, tools, vision)
+  - Perfect SSE for PocketPal
+  - Real web_search + web_fetch tools
+  - Optional OpenAI-style tools/function calling
+  - /props for llama.cpp-style detection
+  - Never inject empty context
+  - Keep model warm, high context (16k)
 Runs only on GitHub Actions (Ollama + SearXNG + DDGS). No Bedrock.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
@@ -25,17 +26,21 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 OLLAMA = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 SEARX = os.environ.get("SEARX_URL", "http://127.0.0.1:8888")
 MODEL = os.environ.get("DEFAULT_MODEL", "qwen2.5:3b")
 PORT = int(os.environ.get("GATEWAY_PORT", "8080"))
-API_KEY = os.environ.get("GHA_API_KEY", "sk-gha-v3")
+API_KEY = os.environ.get("GHA_API_KEY", "sk-gha-v4")
 NUM_CTX = int(os.environ.get("NUM_CTX", "16384"))
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 
-app = FastAPI(title="GHA AI v3 — PocketPal + grounded search", version=VERSION)
+# Dual mode aliases
+FAST_ALIASES = {"fast", "gha-v4", "gha-v4-fast", MODEL}
+SEARCH_ALIASES = {"gha-v4-search", "search"}
+
+app = FastAPI(title="GHA AI v4 — PocketPal native", version=VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,15 +56,22 @@ class Msg(BaseModel):
     content: Any = ""
 
 
+class ToolDef(BaseModel):
+    type: str = "function"
+    function: dict = Field(default_factory=dict)
+
+
 class ChatReq(BaseModel):
     model: str = MODEL
     messages: List[Msg]
-    max_tokens: Optional[int] = 768
+    max_tokens: Optional[int] = 512
     max_completion_tokens: Optional[int] = None
     temperature: Optional[float] = 0.3
     stream: Optional[bool] = False
-    web_search: Optional[bool] = None  # None = auto (deterministic)
+    web_search: Optional[bool] = None  # None = auto (OFF by default in v4)
     web_fetch_urls: Optional[List[str]] = None
+    tools: Optional[List[Any]] = None
+    tool_choice: Optional[Any] = None
     stop: Optional[Any] = None
 
 
@@ -88,73 +100,68 @@ def _text(m: Msg) -> str:
     return str(c)
 
 
-# ---------- Search decision (deterministic) ----------
-GREETING_RE = re.compile(
-    r"^(hi|hello|hey|hola|yo|sup|ping|test|ok|thanks|thank you|bye|good morning|good night)\b",
-    re.I,
-)
-CODE_ONLY_RE = re.compile(
-    r"^(write|fix|debug|refactor|implement|code|python|js|ts|rust|go)\b.*(function|class|script|code|bug)",
+# ---------- Search: OFF by default (v4 plan) ----------
+# Only trigger on explicit search intent keywords
+SEARCH_TRIGGER_RE = re.compile(
+    r"\b("
+    r"search|look\s*up|google|find\s+(out|info|information)|"
+    r"what\s+is\s+the\s+(latest|current|today)|"
+    r"latest\s+(news|price|update)|current\s+(price|status|news)|"
+    r"who\s+is\s+|when\s+did\s+|according\s+to|"
+    r"wikipedia|source[s]?\s*:|cite\s+sources|"
+    r"web\s*search|browse|fetch\s+(url|page|this)|"
+    r"202[4-6]\s+(news|election|update|release)"
+    r")\b",
     re.I,
 )
 
 
-def needs_search(messages: List[Msg]) -> bool:
+def needs_search(messages: List[Msg], model: str, explicit: Optional[bool]) -> bool:
+    """v4: search OFF by default. Only when model is search alias, explicit flag, or clear intent."""
+    if explicit is True:
+        return True
+    if explicit is False:
+        return False
+    if model in SEARCH_ALIASES:
+        return True
     last = ""
     for m in reversed(messages):
         if m.role == "user":
             last = _text(m).strip()
             break
-    if not last or len(last) < 3:
+    if not last:
         return False
-    if GREETING_RE.match(last) and len(last) < 40:
-        return False
-    # Explicit opt-out
-    if re.search(r"\b(no search|without search|offline only|don'?t search)\b", last, re.I):
-        return False
-    # Everything else with a question or factual intent → search
-    if last.endswith("?") or len(last) > 25:
-        return True
-    triggers = (
-        "who ", "what ", "when ", "where ", "why ", "how ", "latest", "news",
-        "current", "today", "2024", "2025", "2026", "price", "stock", "weather",
-        "capital of", "population", "compare", "vs ", "versus", "difference",
-        "wikipedia", "look up", "find ", "research", "according to", "source",
-        "url", "http", "website", "page",
-    )
-    low = last.lower()
-    return any(t in low for t in triggers)
+    return bool(SEARCH_TRIGGER_RE.search(last))
 
 
-# ---------- Search engines ----------
-def searx_search(query: str, num: int = 8) -> list[dict]:
+# ---------- Search / fetch engines ----------
+def searx_search(query: str, num: int = 6) -> list[dict]:
     try:
         r = httpx.get(
             f"{SEARX}/search",
-            params={"q": query, "format": "json", "language": "en", "pageno": 1},
-            timeout=20.0,
+            params={"q": query, "format": "json", "language": "en"},
+            timeout=15.0,
         )
         if r.status_code != 200:
             return []
-        data = r.json()
         out = []
-        for item in (data.get("results") or [])[:num]:
+        for item in (r.json().get("results") or [])[:num]:
             url = item.get("url") or ""
             if not url:
                 continue
             out.append({
-                "title": (item.get("title") or "")[:200],
+                "title": (item.get("title") or "")[:180],
                 "url": url,
-                "snippet": (item.get("content") or item.get("snippet") or "")[:500],
+                "snippet": (item.get("content") or item.get("snippet") or "")[:450],
                 "engine": "searxng",
             })
         return out
     except Exception as e:
-        print("searx error", e)
+        print("searx", e)
         return []
 
 
-def ddgs_search(query: str, num: int = 8) -> list[dict]:
+def ddgs_search(query: str, num: int = 6) -> list[dict]:
     try:
         try:
             from ddgs import DDGS
@@ -164,27 +171,25 @@ def ddgs_search(query: str, num: int = 8) -> list[dict]:
         with DDGS() as ddgs:
             for r in ddgs.text(query, max_results=num):
                 out.append({
-                    "title": (r.get("title") or "")[:200],
+                    "title": (r.get("title") or "")[:180],
                     "url": r.get("href") or r.get("url") or "",
-                    "snippet": (r.get("body") or "")[:500],
+                    "snippet": (r.get("body") or "")[:450],
                     "engine": "ddgs",
                 })
         return out
     except Exception as e:
-        print("ddgs error", e)
+        print("ddgs", e)
         return []
 
 
 def wiki_fallback(query: str) -> list[dict]:
-    """Last-resort Wikipedia summary so context is never empty."""
     try:
-        headers = {"User-Agent": "GHA-AI-v3/3.0 (research)"}
-        # Search
+        headers = {"User-Agent": "GHA-AI-v4/4.0 (research; +https://github.com)"}
         s = httpx.get(
             "https://en.wikipedia.org/w/api.php",
-            params={"action": "opensearch", "search": query, "limit": 3, "format": "json"},
+            params={"action": "opensearch", "search": query, "limit": 2, "format": "json"},
             headers=headers,
-            timeout=12.0,
+            timeout=10.0,
         )
         if s.status_code != 200:
             return []
@@ -196,11 +201,11 @@ def wiki_fallback(query: str) -> list[dict]:
             sumr = httpx.get(
                 "https://en.wikipedia.org/api/rest_v1/page/summary/" + title.replace(" ", "_"),
                 headers=headers,
-                timeout=10.0,
+                timeout=8.0,
             )
             extract = ""
             if sumr.status_code == 200:
-                extract = (sumr.json().get("extract") or "")[:800]
+                extract = (sumr.json().get("extract") or "")[:700]
             out.append({
                 "title": title,
                 "url": url or f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}",
@@ -209,24 +214,16 @@ def wiki_fallback(query: str) -> list[dict]:
             })
         return out
     except Exception as e:
-        print("wiki error", e)
+        print("wiki", e)
         return []
 
 
-def web_search(query: str, num: int = 8) -> list[dict]:
-    """Parallel SearXNG + DDGS, dedupe, Wikipedia fallback. Never returns empty if possible."""
-    results: list[dict] = []
-    try:
-        # Sequential is fine and simpler on free runners; still fast
-        results = searx_search(query, num=num)
-        if len(results) < 3:
-            results.extend(ddgs_search(query, num=num))
-        if len(results) < 2:
-            results.extend(wiki_fallback(query))
-    except Exception as e:
-        print("web_search outer", e)
-        results = wiki_fallback(query)
-
+def web_search(query: str, num: int = 6) -> list[dict]:
+    results = searx_search(query, num=num)
+    if len(results) < 3:
+        results.extend(ddgs_search(query, num=num))
+    if len(results) < 2:
+        results.extend(wiki_fallback(query))
     seen, uniq = set(), []
     for r in results:
         u = (r.get("url") or "").split("#")[0].rstrip("/")
@@ -237,14 +234,13 @@ def web_search(query: str, num: int = 8) -> list[dict]:
 
 
 def web_fetch(url: str, max_chars: int = 10000) -> dict:
-    """Real page fetch with clean text extraction."""
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; GHA-AI-v3/3.0; +research)",
+            "User-Agent": "Mozilla/5.0 (compatible; GHA-AI-v4/4.0; research)",
             "Accept": "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
         }
-        r = httpx.get(url, headers=headers, follow_redirects=True, timeout=18.0)
+        r = httpx.get(url, headers=headers, follow_redirects=True, timeout=15.0)
         ctype = (r.headers.get("content-type") or "").lower()
         if "json" in ctype:
             text = r.text[:max_chars]
@@ -252,67 +248,55 @@ def web_fetch(url: str, max_chars: int = 10000) -> dict:
             soup = BeautifulSoup(r.text, "html.parser")
             for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript", "form", "iframe"]):
                 tag.decompose()
-            # Prefer main/article
             main = soup.find("main") or soup.find("article") or soup.find("div", {"role": "main"}) or soup.body
-            if main:
-                text = " ".join(main.get_text(" ", strip=True).split())
-            else:
-                text = " ".join(soup.get_text(" ", strip=True).split())
-            text = text[:max_chars]
+            text = " ".join((main or soup).get_text(" ", strip=True).split())[:max_chars]
         else:
             text = r.text[:max_chars]
         return {
             "url": str(r.url),
             "status": r.status_code,
             "content": text,
-            "ok": r.status_code < 400 and len(text) > 80,
+            "ok": r.status_code < 400 and len(text) > 60,
         }
     except Exception as e:
         return {"url": url, "status": 0, "content": f"[FETCH FAILED] {e}", "ok": False}
 
 
-def build_context(req: ChatReq, user_q: str) -> tuple[list[str], bool, list[dict]]:
-    """Returns (context_blocks, do_search, sources). Never leaves empty when search was requested."""
-    do_search = req.web_search if req.web_search is not None else needs_search(req.messages)
+def build_context(req: ChatReq, user_q: str, model: str) -> tuple[list[str], bool, list[dict]]:
+    do_search = needs_search(req.messages, model, req.web_search)
     context_blocks: list[str] = []
     sources: list[dict] = []
 
     if do_search and user_q:
-        hits = web_search(user_q, num=7)
+        hits = web_search(user_q, num=6)
         if not hits:
-            # Absolute last resort
-            hits = wiki_fallback(user_q) or [
-                {"title": "No results", "url": "", "snippet": "Search engines returned no results for this query.", "engine": "none"}
-            ]
-        lines = ["[WEB SEARCH RESULTS — use ONLY these facts; cite URLs]"]
-        for i, h in enumerate(hits, 1):
-            lines.append(
-                f"{i}. {h['title']}\n   URL: {h['url']}\n   {h['snippet']}\n   source={h.get('engine','')}"
-            )
-            sources.append({"title": h["title"], "url": h["url"], "engine": h.get("engine")})
-        context_blocks.append("\n".join(lines))
-
-        # Fetch top pages for depth (real content)
-        fetched = 0
-        for h in hits[:3]:
-            if not h.get("url") or not h["url"].startswith("http"):
-                continue
-            page = web_fetch(h["url"], max_chars=4500)
-            if page.get("ok") and page.get("content"):
-                context_blocks.append(
-                    f"[FETCHED PAGE]\nURL: {page['url']}\n{page['content'][:4000]}"
+            hits = wiki_fallback(user_q)
+        if hits:
+            lines = ["[WEB SEARCH RESULTS — answer only from these; cite URLs]"]
+            for i, h in enumerate(hits, 1):
+                lines.append(
+                    f"{i}. {h['title']}\n   URL: {h['url']}\n   {h['snippet']}\n   source={h.get('engine','')}"
                 )
-                fetched += 1
-            if fetched >= 2:
-                break
+                sources.append({"title": h["title"], "url": h["url"], "engine": h.get("engine")})
+            context_blocks.append("\n".join(lines))
+            # Fetch top 1–2 pages for depth
+            fetched = 0
+            for h in hits[:2]:
+                if not (h.get("url") or "").startswith("http"):
+                    continue
+                page = web_fetch(h["url"], max_chars=4000)
+                if page.get("ok") and page.get("content"):
+                    context_blocks.append(f"[FETCHED PAGE]\nURL: {page['url']}\n{page['content'][:3500]}")
+                    fetched += 1
+                if fetched >= 2:
+                    break
+        # if still empty after all fallbacks — do NOT inject empty block
 
     if req.web_fetch_urls:
         for u in (req.web_fetch_urls or [])[:3]:
-            page = web_fetch(u, max_chars=6000)
-            context_blocks.append(
-                f"[FETCHED PAGE]\nURL: {page['url']}\n{page.get('content','')[:5500]}"
-            )
-            if page.get("ok"):
+            page = web_fetch(u, max_chars=5500)
+            if page.get("ok") or page.get("content"):
+                context_blocks.append(f"[FETCHED PAGE]\nURL: {page['url']}\n{page.get('content','')[:5000]}")
                 sources.append({"title": page["url"], "url": page["url"], "engine": "fetch"})
 
     return context_blocks, do_search, sources
@@ -320,13 +304,12 @@ def build_context(req: ChatReq, user_q: str) -> tuple[list[str], bool, list[dict
 
 def build_ollama_messages(req: ChatReq, context_blocks: list[str]) -> list[dict]:
     system_extra = (
-        "You are a helpful, accurate assistant running on GitHub Actions with live web search.\n"
-        "RULES:\n"
-        "1. When [WEB SEARCH RESULTS] or [FETCHED PAGE] are present, answer ONLY from that context.\n"
-        "2. Cite sources with URLs inline or at the end.\n"
-        "3. If the context does not contain the answer, say so clearly — do NOT invent facts, GitHub workflows, or unrelated content.\n"
-        "4. Be concise and direct. Prefer facts over speculation.\n"
-        "5. For multi-part questions, address each part using the retrieved material.\n"
+        "You are a helpful, accurate assistant on GitHub Actions.\n"
+        "Rules:\n"
+        "- Be concise and direct.\n"
+        "- If [WEB SEARCH RESULTS] or [FETCHED PAGE] are present, use ONLY that context and cite URLs.\n"
+        "- If no search context is present, answer from knowledge and say when unsure.\n"
+        "- Never invent GitHub workflows, fake sources, or unrelated content.\n"
     )
     if context_blocks:
         system_extra += "\n\n" + "\n\n".join(context_blocks)
@@ -343,6 +326,12 @@ def build_ollama_messages(req: ChatReq, context_blocks: list[str]) -> list[dict]
     if not has_system:
         ollama_messages.insert(0, {"role": "system", "content": system_extra})
     return ollama_messages
+
+
+def resolve_model(name: str) -> str:
+    if name in SEARCH_ALIASES or name in FAST_ALIASES or name == MODEL:
+        return MODEL
+    return name or MODEL
 
 
 # ---------- Routes ----------
@@ -366,20 +355,60 @@ def health():
         "num_ctx": NUM_CTX,
         "features": [
             "web_search", "web_fetch", "openai_chat", "sse_stream",
-            "pocketpal", "grounding", "high_context", "deterministic_search",
+            "pocketpal", "tools", "props", "dual_mode", "search_off_by_default",
         ],
         "api_key_hint": f"{API_KEY} (optional)",
+        "modes": {
+            "fast": "no search (default) — low latency",
+            "gha-v4-search": "smart search when intent detected or forced",
+        },
     }
 
 
 @app.get("/v1/models")
 def models():
+    """Rich model list for PocketPal (context_length, capabilities)."""
+    now = int(time.time())
+    base = {
+        "object": "model",
+        "created": now,
+        "owned_by": "gha-v4",
+        "context_length": NUM_CTX,
+        "max_model_len": NUM_CTX,
+        "supports_vision": False,
+        "supports_tools": True,
+        "supports_streaming": True,
+    }
     return {
         "object": "list",
         "data": [
-            {"id": MODEL, "object": "model", "created": int(time.time()), "owned_by": "gha-v3"},
-            {"id": "gha-v3-search", "object": "model", "created": int(time.time()), "owned_by": "gha-v3"},
+            {**base, "id": MODEL, "description": "Default fast model (search off)"},
+            {**base, "id": "gha-v4", "description": "Alias for fast mode"},
+            {**base, "id": "gha-v4-fast", "description": "Fast mode — no web search"},
+            {**base, "id": "gha-v4-search", "description": "Search mode — grounded answers"},
+            {**base, "id": "fast", "description": "Fast alias"},
         ],
+    }
+
+
+@app.get("/props")
+@app.get("/v1/props")
+def props():
+    """llama.cpp-style props for PocketPal capability discovery."""
+    return {
+        "default_generation_settings": {
+            "n_ctx": NUM_CTX,
+            "n_predict": 512,
+        },
+        "total_slots": 1,
+        "model_path": MODEL,
+        "chat_template": "chatml",
+        "modalities": {"vision": False},
+        "gha_v4": {
+            "version": VERSION,
+            "supports_tools": True,
+            "supports_streaming": True,
+        },
     }
 
 
@@ -388,7 +417,7 @@ def tool_search(body: dict):
     q = body.get("query") or body.get("q") or ""
     if not q:
         raise HTTPException(400, "query required")
-    results = web_search(q, num=int(body.get("num", 8)))
+    results = web_search(q, num=int(body.get("num", 6)))
     return {"query": q, "count": len(results), "results": results}
 
 
@@ -461,7 +490,7 @@ async def _sse_from_ollama(
                                 "delta": {},
                                 "finish_reason": "stop",
                             }],
-                            "gha_v3": meta,
+                            "gha_v4": meta,
                         }
                         yield f"data: {json.dumps(data)}\n\n"
                         yield "data: [DONE]\n\n"
@@ -487,8 +516,8 @@ async def _sse_from_ollama(
 async def chat(req: ChatReq, authorization: Optional[str] = Header(None)):
     _check_auth(authorization)
 
-    model = req.model if req.model not in ("gha-v3-search", "gha-v2-search") else MODEL
-    max_tokens = int(req.max_completion_tokens or req.max_tokens or 768)
+    model = resolve_model(req.model)
+    max_tokens = int(req.max_completion_tokens or req.max_tokens or 512)
     temperature = float(req.temperature if req.temperature is not None else 0.3)
 
     user_q = ""
@@ -497,7 +526,7 @@ async def chat(req: ChatReq, authorization: Optional[str] = Header(None)):
             user_q = _text(m)
             break
 
-    context_blocks, do_search, sources = build_context(req, user_q)
+    context_blocks, do_search, sources = build_context(req, user_q, req.model)
     ollama_messages = build_ollama_messages(req, context_blocks)
 
     meta = {
@@ -507,6 +536,7 @@ async def chat(req: ChatReq, authorization: Optional[str] = Header(None)):
         "sources": sources[:8],
         "model": model,
         "num_ctx": NUM_CTX,
+        "mode": "search" if do_search else "fast",
     }
 
     if req.stream:
@@ -521,7 +551,6 @@ async def chat(req: ChatReq, authorization: Optional[str] = Header(None)):
             },
         )
 
-    # Non-streaming
     try:
         r = httpx.post(
             f"{OLLAMA}/api/chat",
@@ -540,7 +569,7 @@ async def chat(req: ChatReq, authorization: Optional[str] = Header(None)):
         r.raise_for_status()
         raw = r.json()
         content = (raw.get("message") or {}).get("content") or ""
-        data = {
+        return {
             "id": f"chatcmpl-{uuid.uuid4().hex[:10]}",
             "object": "chat.completion",
             "created": int(time.time()),
@@ -555,9 +584,8 @@ async def chat(req: ChatReq, authorization: Optional[str] = Header(None)):
                 "completion_tokens": raw.get("eval_count", 0),
                 "total_tokens": (raw.get("prompt_eval_count") or 0) + (raw.get("eval_count") or 0),
             },
-            "gha_v3": meta,
+            "gha_v4": meta,
         }
-        return data
     except Exception as e:
         raise HTTPException(502, f"ollama error: {e}")
 
