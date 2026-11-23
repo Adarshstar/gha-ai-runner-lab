@@ -1,0 +1,142 @@
+name: openai-endpoint-v2
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: "Minutes to keep v2 endpoint alive (max 300)"
+        required: false
+        default: "180"
+  push:
+    paths:
+      - "TRIGGER_V2"
+
+permissions:
+  contents: write
+
+jobs:
+  serve-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SearXNG (local metasearch)
+        run: |
+          set -e
+          docker run -d --name searxng -p 127.0.0.1:8888:8080 docker.io/searxng/searxng:latest
+          for i in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:8888/" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          # JSON search smoke
+          curl -fsS "http://127.0.0.1:8888/search?q=OpenAI&format=json" | head -c 300 || true
+          echo
+
+      - name: Install Ollama + model
+        run: |
+          set -e
+          curl -fsSL https://ollama.com/install.sh | sh
+          export OLLAMA_HOST=0.0.0.0:11434
+          export OLLAMA_ORIGINS='*'
+          nohup ollama serve >ollama.log 2>&1 &
+          echo $! > ollama.pid
+          for i in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+            sleep 1
+          done
+          ollama pull qwen2.5:0.5b
+          ollama list
+
+      - name: Install gateway deps
+        run: |
+          set -e
+          python3 -m pip install -q -r gateway/requirements.txt
+
+      - name: Start v2 gateway
+        run: |
+          set -e
+          export OLLAMA_URL=http://127.0.0.1:11434
+          export SEARX_URL=http://127.0.0.1:8888
+          export DEFAULT_MODEL=qwen2.5:0.5b
+          export GATEWAY_PORT=8080
+          nohup python3 gateway/server.py >gateway.log 2>&1 &
+          echo $! > gateway.pid
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/health | tee health.json
+          echo
+
+      - name: Local tests (search + fetch + chat)
+        run: |
+          set -e
+          echo "=== web_search ==="
+          curl -fsS http://127.0.0.1:8080/v1/tools/web_search \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"GitHub Actions maximum job timeout hours","num":4}' | tee search.json
+          echo
+          python3 -c "import json;d=json.load(open('search.json'));assert len(d.get('results',[]))>=1,d;print('search_ok',len(d['results']))"
+          URL=$(python3 -c "import json;d=json.load(open('search.json'));print(d['results'][0]['url'])")
+          echo "=== web_fetch $URL ==="
+          curl -fsS http://127.0.0.1:8080/v1/tools/web_fetch \
+            -H 'Content-Type: application/json' \
+            -d "{\"url\":\"$URL\",\"max_chars\":2000}" | tee fetch.json
+          echo
+          python3 -c "import json;d=json.load(open('fetch.json'));assert d.get('ok') or d.get('content');print('fetch_ok',d.get('status'),len(d.get('content','')))"
+          echo "=== chat with auto search ==="
+          curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"What is the maximum job timeout for GitHub Actions hosted runners in hours?"}],"max_tokens":200,"web_search":true}' \
+            | tee chat.json
+          echo
+          python3 -c "import json;d=json.load(open('chat.json'));print('ASSISTANT:',d['choices'][0]['message']['content'][:500]);print('gha_v2',d.get('gha_v2'))"
+
+      - name: Public tunnel + publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          sudo npm install -g localtunnel
+          nohup lt --port 8080 > lt.log 2>&1 &
+          echo $! > lt.pid
+          URL=""
+          for i in $(seq 1 90); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.loca\.lt' lt.log | head -1 || true)
+            if [ -z "$URL" ]; then URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.localtunnel\.me' lt.log | head -1 || true); fi
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          test -n "$URL"
+          echo "PUBLIC_URL=$URL" | tee public_url.txt
+          echo "BASE_URL=$URL/v1"
+          git config user.name gha-bot
+          git config user.email gha-bot@users.noreply.github.com
+          git fetch origin || true
+          git checkout -B live-endpoint-v2 || true
+          printf '%s\n' "$URL" > LIVE_BASE_URL_V2.txt
+          printf '%s/v1\n' "$URL" > LIVE_OPENAI_BASE_V2.txt
+          printf 'qwen2.5:0.5b\n' > LIVE_MODEL_V2.txt
+          printf 'V2 LIVE\nBASE=%s/v1\nSEARCH=%s/v1/tools/web_search\nFETCH=%s/v1/tools/web_fetch\nMODEL=qwen2.5:0.5b\n' "$URL" "$URL" "$URL" > LIVE_ENDPOINT_V2.md
+          git add LIVE_BASE_URL_V2.txt LIVE_OPENAI_BASE_V2.txt LIVE_MODEL_V2.txt LIVE_ENDPOINT_V2.md || true
+          git commit -m "v2 live $URL" || true
+          git push -f origin live-endpoint-v2 || echo "publish failed, hold continues"
+
+      - name: Hold
+        run: |
+          set -e
+          HOLD="${{ github.event.inputs.hold_minutes }}"
+          HOLD=${HOLD:-180}
+          if [ "$HOLD" -gt 300 ]; then HOLD=300; fi
+          URL=$(grep PUBLIC_URL public_url.txt | cut -d= -f2)
+          echo "V2 GHA-ONLY $URL/v1 hold ${HOLD}m"
+          SECS=$((HOLD * 60))
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            kill -0 $(cat ollama.pid) 2>/dev/null || exit 1
+            kill -0 $(cat gateway.pid) 2>/dev/null || exit 1
+            curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
+            echo "$(date -u +%H:%M:%S)Z v2 still up $URL/v1"
+            sleep 30
+          done
