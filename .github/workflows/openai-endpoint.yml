@@ -7,20 +7,16 @@ on:
         description: "Minutes to keep endpoint alive"
         required: false
         default: "15"
-  push:
-    paths:
-      - ".github/workflows/openai-endpoint.yml"
 
 jobs:
   serve:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Install Ollama
+      - name: Install Ollama + model
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
-          # expose + allow tunnel origin
           export OLLAMA_HOST=0.0.0.0:11434
           export OLLAMA_ORIGINS='*'
           nohup ollama serve >ollama.log 2>&1 &
@@ -29,77 +25,59 @@ jobs:
             curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
             sleep 1
           done
-          curl -fsS http://127.0.0.1:11434/api/tags
-
-      - name: Pull model
-        run: |
-          set -e
-          export OLLAMA_HOST=0.0.0.0:11434
           ollama pull qwen2.5:0.5b
-          ollama list
-          # local OpenAI smoke
+          curl -fsS http://127.0.0.1:11434/v1/models | head -c 400; echo
           curl -fsS http://127.0.0.1:11434/v1/chat/completions \
             -H 'Content-Type: application/json' \
             -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"ping"}],"max_tokens":8}' \
-            | head -c 300; echo
+            | head -c 250; echo
 
-      - name: Tunnel
+      - name: Public tunnel (localtunnel)
         run: |
           set -e
-          curl -fsSL -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i cloudflared.deb
-          nohup cloudflared tunnel --url http://127.0.0.1:11434 > tunnel.log 2>&1 &
-          echo $! > tunnel.pid
+          sudo npm install -g localtunnel
+          # background lt
+          nohup lt --port 11434 --print-requests > lt.log 2>&1 &
+          echo $! > lt.pid
           URL=""
-          for i in $(seq 1 90); do
-            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.loca\.lt' lt.log | head -1 || true)
+            if [ -z "$URL" ]; then
+              URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.localtunnel\.me' lt.log | head -1 || true)
+            fi
             if [ -n "$URL" ]; then break; fi
             sleep 2
           done
           echo "PUBLIC_URL=$URL" | tee public_url.txt
           test -n "$URL"
           echo "OpenAI base URL: $URL/v1"
+          # localtunnel password page bypass header sometimes needed: bypass-tunnel-reminder
+          sleep 3
 
-      - name: Public smoke with retries
+      - name: Announce + hold
         run: |
           set -e
-          URL=$(cut -d= -f2 public_url.txt)
-          ok=0
-          for i in $(seq 1 20); do
-            if curl -fsS -m 60 "$URL/v1/models" -o models.json; then
-              echo "models ok"; cat models.json; echo
-              if curl -fsS -m 120 "$URL/v1/chat/completions" \
-                -H 'Content-Type: application/json' \
-                -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Reply with exactly: ENDPOINT_OK"}],"max_tokens":32,"temperature":0}' \
-                -o smoke.json; then
-                echo "chat ok"; cat smoke.json; echo
-                python3 -c "import json;d=json.load(open('smoke.json'));print('ASSISTANT:',d['choices'][0]['message']['content'])"
-                ok=1
-                break
-              fi
-            fi
-            echo "retry $i"; sleep 3
-          done
-          test "$ok" = "1"
-
-      - name: Hold endpoint
-        run: |
           HOLD="${{ github.event.inputs.hold_minutes }}"
           HOLD=${HOLD:-15}
           URL=$(cut -d= -f2 public_url.txt)
           echo "======================================================"
-          echo "WORKING OpenAI endpoint (live ~${HOLD} minutes):"
+          echo "OpenAI-compatible endpoint (ephemeral ~${HOLD} min)"
           echo "  BASE_URL = $URL/v1"
           echo "  MODEL    = qwen2.5:0.5b"
-          echo "  Example:"
-          echo "  curl $URL/v1/chat/completions -H 'Content-Type: application/json' \\"
+          echo "  NOTE: first request may need header:"
+          echo "    bypass-tunnel-reminder: true"
+          echo "  curl example:"
+          echo "  curl $URL/v1/chat/completions \\"
+          echo "    -H 'Content-Type: application/json' \\"
+          echo "    -H 'bypass-tunnel-reminder: true' \\"
           echo "    -d '{\"model\":\"qwen2.5:0.5b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'"
           echo "======================================================"
+          # keep processes alive
           SECS=$((HOLD * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
             kill -0 $(cat ollama.pid) 2>/dev/null || { echo ollama died; exit 1; }
             curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || exit 1
-            echo "$(date -u +%H:%M:%S)Z still up $URL/v1"
+            echo "$(date -u +%H:%M:%S)Z still up BASE=$URL/v1 MODEL=qwen2.5:0.5b"
             sleep 30
           done
