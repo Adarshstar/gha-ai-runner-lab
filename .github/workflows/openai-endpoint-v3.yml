@@ -1,0 +1,182 @@
+name: openai-endpoint-v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: "Minutes to keep v3 endpoint alive (max 300)"
+        required: false
+        default: "180"
+  push:
+    paths:
+      - "TRIGGER_V3"
+
+permissions:
+  contents: write
+
+jobs:
+  serve-v3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start SearXNG (local metasearch)
+        run: |
+          set -e
+          docker run -d --name searxng -p 127.0.0.1:8888:8080 docker.io/searxng/searxng:latest
+          for i in $(seq 1 60); do
+            curl -fsS "http://127.0.0.1:8888/" >/dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -fsS "http://127.0.0.1:8888/search?q=OpenAI&format=json" | head -c 200 || true
+          echo
+
+      - name: Install Ollama + qwen2.5:3b
+        run: |
+          set -e
+          curl -fsSL https://ollama.com/install.sh | sh
+          export OLLAMA_HOST=0.0.0.0:11434
+          export OLLAMA_ORIGINS='*'
+          nohup ollama serve >ollama.log 2>&1 &
+          echo $! > ollama.pid
+          for i in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
+            sleep 1
+          done
+          ollama pull qwen2.5:3b
+          ollama list
+
+      - name: Install gateway deps
+        run: |
+          set -e
+          python3 -m pip install -q -r gateway/requirements.txt
+
+      - name: Start v3 gateway
+        run: |
+          set -e
+          export OLLAMA_URL=http://127.0.0.1:11434
+          export SEARX_URL=http://127.0.0.1:8888
+          export DEFAULT_MODEL=qwen2.5:3b
+          export GATEWAY_PORT=8080
+          export GHA_API_KEY=sk-gha-v3
+          export NUM_CTX=16384
+          nohup python3 gateway/server.py >gateway.log 2>&1 &
+          echo $! > gateway.pid
+          for i in $(seq 1 60); do
+            curl -fsS http://127.0.0.1:8080/health && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/health | tee health.json
+          echo
+
+      - name: Local tests (models + search + fetch + chat + SSE)
+        run: |
+          set -e
+          echo "=== models ==="
+          curl -fsS http://127.0.0.1:8080/v1/models | tee models.json
+          echo
+          echo "=== web_search ==="
+          curl -fsS http://127.0.0.1:8080/v1/tools/web_search \
+            -H 'Content-Type: application/json' \
+            -d '{"query":"capital of France population 2024","num":5}' | tee search.json
+          python3 -c "import json;d=json.load(open('search.json'));assert d.get('count',0)>=1,d;print('search_ok',d['count'])"
+          echo
+          echo "=== web_fetch ==="
+          curl -fsS http://127.0.0.1:8080/v1/tools/web_fetch \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://en.wikipedia.org/wiki/Paris","max_chars":2000}' | tee fetch.json
+          python3 -c "import json;d=json.load(open('fetch.json'));assert d.get('ok') or len(d.get('content',''))>50,d;print('fetch_ok',len(d.get('content','')))"
+          echo
+          echo "=== non-stream grounded chat ==="
+          curl -fsS http://127.0.0.1:8080/v1/chat/completions \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"gha-v3-search","messages":[{"role":"user","content":"What is the capital of France? Cite sources."}],"max_tokens":200,"stream":false}' \
+            | tee chat.json
+          python3 -c "
+          import json
+          d=json.load(open('chat.json'))
+          c=d['choices'][0]['message']['content']
+          m=d.get('gha_v3',{})
+          print('ASSISTANT:', c[:400])
+          print('gha_v3:', m)
+          assert m.get('web_search') is True
+          assert m.get('context_blocks',0) >= 1, 'empty context not allowed'
+          assert 'Paris' in c or 'paris' in c.lower()
+          print('grounded_ok')
+          "
+          echo
+          echo "=== SSE stream ==="
+          curl -s -m 45 -H 'Content-Type: application/json' \
+            -d '{"model":"qwen2.5:3b","messages":[{"role":"user","content":"Hello"}],"max_tokens":30,"stream":true}' \
+            http://127.0.0.1:8080/v1/chat/completions | head -c 500
+          echo
+          echo "ALL_LOCAL_TESTS_PASSED"
+
+      - name: Public tunnel (cloudflared) + publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+          chmod +x /tmp/cloudflared
+          nohup /tmp/cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cf.log 2>&1 &
+          echo $! > cf.pid
+          URL=""
+          for i in $(seq 1 60); do
+            URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cf.log | head -1 || true)
+            if [ -n "$URL" ]; then break; fi
+            sleep 2
+          done
+          test -n "$URL"
+          echo "PUBLIC_URL=$URL" | tee public_url.txt
+          echo "BASE_URL=$URL/v1"
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || echo 000)
+            [ "$code" = "200" ] && break
+            sleep 2
+          done
+          curl -fsS "$URL/health" | tee public_health.json
+          echo
+          curl -s -m 30 -H "Content-Type: application/json" \
+            -d '{"model":"qwen2.5:3b","messages":[{"role":"user","content":"Hi"}],"max_tokens":20,"stream":true}' \
+            "$URL/v1/chat/completions" | head -c 400 || true
+          echo
+          git config user.name gha-bot
+          git config user.email gha-bot@users.noreply.github.com
+          git fetch origin || true
+          git checkout -B live-endpoint-v3 || true
+          printf '%s\n' "$URL" > LIVE_BASE_URL_V3.txt
+          printf '%s/v1\n' "$URL" > LIVE_OPENAI_BASE_V3.txt
+          printf 'qwen2.5:3b\n' > LIVE_MODEL_V3.txt
+          printf 'sk-gha-v3\n' > LIVE_API_KEY_V3.txt
+          {
+            echo "# GHA AI v3 — PocketPal ready"
+            echo "Base URL: $URL/v1"
+            echo "API Key: sk-gha-v3"
+            echo "Model: qwen2.5:3b (high context 16k)"
+            echo "Tunnel: Cloudflare Quick Tunnel"
+            echo "Features: deterministic search, real fetch, grounding, SSE, PocketPal"
+          } > LIVE_ENDPOINT_V3.md
+          git add LIVE_BASE_URL_V3.txt LIVE_OPENAI_BASE_V3.txt LIVE_MODEL_V3.txt LIVE_API_KEY_V3.txt LIVE_ENDPOINT_V3.md || true
+          git commit -m "v3 live $URL (qwen2.5:3b + grounded search)" || true
+          git push -f origin live-endpoint-v3 || echo "publish failed, hold continues"
+
+      - name: Hold
+        run: |
+          set -e
+          HOLD="${{ github.event.inputs.hold_minutes }}"
+          HOLD=${HOLD:-180}
+          if [ "$HOLD" -gt 300 ]; then HOLD=300; fi
+          URL=$(grep PUBLIC_URL public_url.txt | cut -d= -f2)
+          echo "V3 GHA PocketPal-ready $URL/v1 hold ${HOLD}m key=sk-gha-v3 model=qwen2.5:3b"
+          SECS=$((HOLD * 60))
+          END=$((SECONDS + SECS))
+          while [ $SECONDS -lt $END ]; do
+            kill -0 $(cat ollama.pid) 2>/dev/null || exit 1
+            kill -0 $(cat gateway.pid) 2>/dev/null || exit 1
+            kill -0 $(cat cf.pid) 2>/dev/null || exit 1
+            curl -fsS http://127.0.0.1:8080/health >/dev/null || exit 1
+            echo "$(date -u +%H:%M:%S)Z v3 still up $URL/v1"
+            sleep 30
+          done
