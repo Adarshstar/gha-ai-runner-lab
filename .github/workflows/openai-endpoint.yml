@@ -1,11 +1,10 @@
 name: openai-endpoint
 
-# Self-hosted model ONLY on GitHub Actions (no Bedrock, no NEZ).
 on:
   workflow_dispatch:
     inputs:
       hold_minutes:
-        description: "Minutes to keep endpoint alive (max ~300)"
+        description: "Minutes to keep endpoint alive (max 300 = 5h)"
         required: false
         default: "300"
 
@@ -14,7 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Install Ollama (self-hosted on this runner)
+      - uses: actions/checkout@v4
+
+      - name: Install Ollama
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
@@ -27,20 +28,19 @@ jobs:
             sleep 1
           done
 
-      - name: Pull self-hosted model only
+      - name: Pull only self-hosted model
         run: |
           set -e
           export OLLAMA_HOST=0.0.0.0:11434
           ollama pull qwen2.5:0.5b
           ollama list
-          curl -fsS http://127.0.0.1:11434/v1/models | tee models.json
           curl -fsS http://127.0.0.1:11434/v1/chat/completions \
             -H 'Content-Type: application/json' \
-            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Reply with exactly: GHA_OK"}],"max_tokens":16,"temperature":0}' \
-            | tee local_smoke.json
-          echo
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Reply with exactly: GHA_OK"}],"max_tokens":16,"temperature":0}'
 
-      - name: Public tunnel (localtunnel only)
+      - name: Tunnel + publish URL to repo
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -e
           sudo npm install -g localtunnel
@@ -49,43 +49,55 @@ jobs:
           URL=""
           for i in $(seq 1 90); do
             URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.loca\.lt' lt.log | head -1 || true)
-            if [ -z "$URL" ]; then
-              URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.localtunnel\.me' lt.log | head -1 || true)
-            fi
-            if [ -n "$URL" ]; then break; fi
+            [ -z "$URL" ] && URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.localtunnel\.me' lt.log | head -1 || true)
+            [ -n "$URL" ] && break
             sleep 2
           done
-          echo "PUBLIC_URL=$URL" | tee public_url.txt
-          echo "BASE_URL=$URL/v1" | tee -a public_url.txt
-          echo "MODEL=qwen2.5:0.5b" | tee -a public_url.txt
           test -n "$URL"
-          echo "::notice title=OpenAI endpoint::$URL/v1 model=qwen2.5:0.5b"
-          echo "### OpenAI endpoint (GHA self-hosted only)" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **BASE_URL:** \`$URL/v1\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **MODEL:** \`qwen2.5:0.5b\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Only model:** self-hosted Ollama on this runner (no Bedrock)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **Header if needed:** \`bypass-tunnel-reminder: true\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "PUBLIC_URL=$URL" | tee public_url.txt
+          echo "BASE_URL=$URL/v1"
+          echo "MODEL=qwen2.5:0.5b"
+          # Publish live endpoint to a branch so it is readable immediately
+          git config user.name "gha-bot"
+          git config user.email "gha-bot@users.noreply.github.com"
+          git fetch origin
+          git checkout -B live-endpoint
+          cat > LIVE_ENDPOINT.md << MD
+# Live GHA self-hosted endpoint
 
-      - name: Hold up to 5 hours
+- **Status:** LIVE (GitHub Actions runner only — no Bedrock)
+- **BASE_URL:** \`$URL/v1\`
+- **MODEL:** \`qwen2.5:0.5b\`
+- **Started (UTC):** $(date -u -Iseconds)
+- **Header if needed:** \`bypass-tunnel-reminder: true\`
+
+\`\`\`bash
+curl $URL/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "bypass-tunnel-reminder: true" \\
+  -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"hi"}]}'
+\`\`\`
+MD
+          echo "$URL" > LIVE_BASE_URL.txt
+          echo "$URL/v1" > LIVE_OPENAI_BASE.txt
+          echo "qwen2.5:0.5b" > LIVE_MODEL.txt
+          git add LIVE_ENDPOINT.md LIVE_BASE_URL.txt LIVE_OPENAI_BASE.txt LIVE_MODEL.txt
+          git commit -m "live endpoint $URL" || true
+          git push -f origin live-endpoint
+
+      - name: Hold 5 hours
         run: |
           set -e
           HOLD="${{ github.event.inputs.hold_minutes }}"
           HOLD=${HOLD:-300}
-          if [ "$HOLD" -gt 300 ]; then HOLD=300; fi
-          URL=$(grep '^PUBLIC_URL=' public_url.txt | cut -d= -f2)
-          echo "======================================================"
-          echo "STRICTLY GitHub Actions self-hosted model"
-          echo "  BASE_URL = $URL/v1"
-          echo "  MODEL    = qwen2.5:0.5b"
-          echo "  HOLD     = ${HOLD} minutes"
-          echo "  NO Bedrock / NO NEZ proxy"
-          echo "======================================================"
+          [ "$HOLD" -gt 300 ] && HOLD=300
+          URL=$(cut -d= -f2 public_url.txt | head -1)
+          echo "GHA-ONLY endpoint live ${HOLD}m: $URL/v1 model=qwen2.5:0.5b"
           SECS=$((HOLD * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
-            kill -0 $(cat ollama.pid) 2>/dev/null || { echo ollama died; exit 1; }
+            kill -0 $(cat ollama.pid) 2>/dev/null || exit 1
             curl -fsS http://127.0.0.1:11434/api/tags >/dev/null || exit 1
-            echo "$(date -u +%H:%M:%S)Z still up BASE=$URL/v1 MODEL=qwen2.5:0.5b"
+            echo "$(date -u +%H:%M:%S)Z still up $URL/v1"
             sleep 30
           done
