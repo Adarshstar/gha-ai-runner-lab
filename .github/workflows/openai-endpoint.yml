@@ -1,6 +1,10 @@
 name: openai-endpoint
 
 on:
+  push:
+    paths:
+      - ".github/workflows/openai-endpoint.yml"
+      - "TRIGGER"
   workflow_dispatch:
     inputs:
       hold_minutes:
