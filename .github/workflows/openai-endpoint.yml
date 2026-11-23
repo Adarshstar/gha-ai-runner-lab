@@ -1,19 +1,20 @@
 name: openai-endpoint
 
+# Self-hosted model ONLY on GitHub Actions (no Bedrock, no NEZ).
 on:
   workflow_dispatch:
     inputs:
       hold_minutes:
-        description: "Minutes to keep endpoint alive"
+        description: "Minutes to keep endpoint alive (max ~300)"
         required: false
-        default: "15"
+        default: "300"
 
 jobs:
   serve:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 360
     steps:
-      - name: Install Ollama + model
+      - name: Install Ollama (self-hosted on this runner)
         run: |
           set -e
           curl -fsSL https://ollama.com/install.sh | sh
@@ -25,22 +26,28 @@ jobs:
             curl -fsS http://127.0.0.1:11434/api/tags >/dev/null 2>&1 && break
             sleep 1
           done
+
+      - name: Pull self-hosted model only
+        run: |
+          set -e
+          export OLLAMA_HOST=0.0.0.0:11434
           ollama pull qwen2.5:0.5b
-          curl -fsS http://127.0.0.1:11434/v1/models | head -c 400; echo
+          ollama list
+          curl -fsS http://127.0.0.1:11434/v1/models | tee models.json
           curl -fsS http://127.0.0.1:11434/v1/chat/completions \
             -H 'Content-Type: application/json' \
-            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"ping"}],"max_tokens":8}' \
-            | head -c 250; echo
+            -d '{"model":"qwen2.5:0.5b","messages":[{"role":"user","content":"Reply with exactly: GHA_OK"}],"max_tokens":16,"temperature":0}' \
+            | tee local_smoke.json
+          echo
 
-      - name: Public tunnel (localtunnel)
+      - name: Public tunnel (localtunnel only)
         run: |
           set -e
           sudo npm install -g localtunnel
-          # background lt
-          nohup lt --port 11434 --print-requests > lt.log 2>&1 &
+          nohup lt --port 11434 > lt.log 2>&1 &
           echo $! > lt.pid
           URL=""
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.loca\.lt' lt.log | head -1 || true)
             if [ -z "$URL" ]; then
               URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.localtunnel\.me' lt.log | head -1 || true)
@@ -49,30 +56,31 @@ jobs:
             sleep 2
           done
           echo "PUBLIC_URL=$URL" | tee public_url.txt
+          echo "BASE_URL=$URL/v1" | tee -a public_url.txt
+          echo "MODEL=qwen2.5:0.5b" | tee -a public_url.txt
           test -n "$URL"
-          echo "OpenAI base URL: $URL/v1"
-          # localtunnel password page bypass header sometimes needed: bypass-tunnel-reminder
-          sleep 3
+          echo "::notice title=OpenAI endpoint::$URL/v1 model=qwen2.5:0.5b"
+          echo "### OpenAI endpoint (GHA self-hosted only)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **BASE_URL:** \`$URL/v1\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **MODEL:** \`qwen2.5:0.5b\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Only model:** self-hosted Ollama on this runner (no Bedrock)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Header if needed:** \`bypass-tunnel-reminder: true\`" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Announce + hold
+      - name: Hold up to 5 hours
         run: |
           set -e
           HOLD="${{ github.event.inputs.hold_minutes }}"
-          HOLD=${HOLD:-15}
-          URL=$(cut -d= -f2 public_url.txt)
+          HOLD=${HOLD:-300}
+          if [ "$HOLD" -gt 300 ]; then HOLD=300; fi
+          URL=$(grep '^PUBLIC_URL=' public_url.txt | cut -d= -f2)
           echo "======================================================"
-          echo "OpenAI-compatible endpoint (ephemeral ~${HOLD} min)"
+          echo "STRICTLY GitHub Actions self-hosted model"
           echo "  BASE_URL = $URL/v1"
           echo "  MODEL    = qwen2.5:0.5b"
-          echo "  NOTE: first request may need header:"
-          echo "    bypass-tunnel-reminder: true"
-          echo "  curl example:"
-          echo "  curl $URL/v1/chat/completions \\"
-          echo "    -H 'Content-Type: application/json' \\"
-          echo "    -H 'bypass-tunnel-reminder: true' \\"
-          echo "    -d '{\"model\":\"qwen2.5:0.5b\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'"
+          echo "  HOLD     = ${HOLD} minutes"
+          echo "  NO Bedrock / NO NEZ proxy"
           echo "======================================================"
-          # keep processes alive
           SECS=$((HOLD * 60))
           END=$((SECONDS + SECS))
           while [ $SECONDS -lt $END ]; do
